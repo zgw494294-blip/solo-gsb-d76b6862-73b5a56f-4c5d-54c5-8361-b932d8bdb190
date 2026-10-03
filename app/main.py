@@ -1,12 +1,13 @@
 """舞台提示执行台 —— FastAPI + SQLite 后端。
 
 并发模型：所有写操作（确认 / 暂停 / 恢复 / 编辑 / 重排 / 归档 / 设置 /
-重置 / 以档案开新场）都在同一把锁内串行完成；其中带版本号的操作
-（确认 / 暂停恢复 / 编辑 / 重排 / 归档 / 以档案开新场）在锁内完成
-"检查版本号 -> 修改数据"两个步骤，因此同一版本号上并发的两个操作
-只会有一个生效，另一个收到 409 及最新状态。归档的"写档案 + 清空提示"、
-以档案开新场的"写入新场提示 + 推进状态"、暂停恢复的"暂停标记 + 版本 +1"
-都在同一事务内提交，任一步失败整体回滚。
+重置 / 以档案开新场 / 追加问题记录）都在同一把锁内串行完成；其中带
+版本号的操作（确认 / 暂停恢复 / 编辑 / 重排 / 归档 / 以档案开新场 /
+追加问题记录）在锁内完成"检查版本号 -> 修改数据"两个步骤，因此同一
+版本号上并发的两个操作只会有一个生效，另一个收到 409 及最新状态。
+归档的"写档案 + 清空提示与问题记录"、以档案开新场的"写入新场提示 +
+推进状态"、暂停恢复的"暂停标记 + 版本 +1"、追加问题记录的"写入记录 +
+版本 +1"都在同一事务内提交，任一步失败整体回滚。
 """
 import json
 import os
@@ -26,6 +27,7 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "data", "cues.db"))
 
 MIN_CUES = 2
 MAX_CUES = 12
+MAX_NOTE_LEN = 200  # 问题记录正文（去首尾空白后）的最大字符数
 
 # 串行化所有写操作，保证版本检查与落库是原子的。
 lock = threading.Lock()
@@ -81,7 +83,17 @@ def init_db() -> None:
                 status      TEXT NOT NULL,              -- 归档当时状态：live | done
                 version     INTEGER NOT NULL,           -- 归档时携带的页面版本
                 issued      TEXT NOT NULL,              -- 已发：编号/快照/时间（按发出顺序）
-                pending     TEXT NOT NULL               -- 剩余：编号/内容（按待发顺序）
+                pending     TEXT NOT NULL,              -- 剩余：编号/内容（按待发顺序）
+                notes       TEXT NOT NULL DEFAULT '[]'  -- 现场问题记录快照（按保存顺序）
+            );
+            CREATE TABLE IF NOT EXISTS notes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                cue_id     INTEGER NOT NULL,            -- 记录时提示的 id
+                number     TEXT NOT NULL,               -- 记录时提示的编号快照
+                content    TEXT NOT NULL,               -- 记录时内容快照（已发取发出快照）
+                cue_status TEXT NOT NULL,               -- 记录时提示状态：pending | issued
+                text       TEXT NOT NULL,               -- 问题正文（已去首尾空白）
+                created_at TEXT NOT NULL                -- 服务端记录时间（UTC ISO）
             );
             """
         )
@@ -94,9 +106,28 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE meta ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
             )
+        # 旧库升级：archives 表缺少 notes 列时补上，已有档案默认无问题记录。
+        archive_columns = {r["name"] for r in conn.execute("PRAGMA table_info(archives)")}
+        if "notes" not in archive_columns:
+            conn.execute(
+                "ALTER TABLE archives ADD COLUMN notes TEXT NOT NULL DEFAULT '[]'"
+            )
 
 
 # ---------------------------------------------------------------- 状态组装
+
+def note_json(r: sqlite3.Row) -> dict:
+    """问题记录的对外结构：编号/内容/状态均为记录那一刻的快照。"""
+    return {
+        "id": r["id"],
+        "cue_id": r["cue_id"],
+        "number": r["number"],
+        "content": r["content"],
+        "cue_status": r["cue_status"],
+        "text": r["text"],
+        "created_at": r["created_at"],
+    }
+
 
 def build_state(conn: sqlite3.Connection) -> dict:
     meta = conn.execute(
@@ -105,6 +136,7 @@ def build_state(conn: sqlite3.Connection) -> dict:
     rows = conn.execute(
         "SELECT * FROM cues ORDER BY position ASC, id ASC"
     ).fetchall()
+    notes = conn.execute("SELECT * FROM notes ORDER BY id ASC").fetchall()
     pending = [r for r in rows if r["status"] == "pending"]
     issued = sorted(
         (r for r in rows if r["status"] == "issued"),
@@ -130,10 +162,12 @@ def build_state(conn: sqlite3.Connection) -> dict:
         "next": pending_json(pending[1]) if len(pending) > 1 else None,
         "pending": [pending_json(r) for r in pending],
         "issued": [issued_json(r) for r in issued],
+        "notes": [note_json(r) for r in notes],
         "total": len(rows),
         "remaining": len(pending),
         "min_cues": MIN_CUES,
         "max_cues": MAX_CUES,
+        "max_note_len": MAX_NOTE_LEN,
     }
 
 
@@ -190,6 +224,21 @@ def archive_snapshots(conn: sqlite3.Connection) -> tuple[list[dict], list[dict]]
     return issued, pending
 
 
+def archive_note_snapshots(conn: sqlite3.Connection) -> list[dict]:
+    """归档时的问题记录快照：按保存顺序，字段与记录那一刻一致。"""
+    rows = conn.execute("SELECT * FROM notes ORDER BY id ASC").fetchall()
+    return [
+        {
+            "number": r["number"],
+            "content": r["content"],
+            "cue_status": r["cue_status"],
+            "text": r["text"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
 def archive_summary(row: sqlite3.Row) -> dict:
     issued = json.loads(row["issued"])
     pending = json.loads(row["pending"])
@@ -212,6 +261,8 @@ def archive_detail(row: sqlite3.Row) -> dict:
         "version": row["version"],
         "issued": json.loads(row["issued"]),
         "pending": json.loads(row["pending"]),
+        # 旧档案没有 notes 列时迁移默认 '[]'，这里再兜底一次
+        "notes": json.loads(row["notes"] or "[]"),
     }
 
 
@@ -361,6 +412,12 @@ class StartFromArchiveIn(BaseModel):
     version: int
 
 
+class NoteIn(BaseModel):
+    version: int
+    cue_id: int
+    text: str
+
+
 @app.get("/api/state")
 def get_state():
     with db() as conn:
@@ -432,6 +489,7 @@ def setup(body: SetupIn):
 
     with lock, db() as conn:
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM notes")
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "
@@ -568,11 +626,48 @@ def reorder(body: ReorderIn):
         return build_state(conn)
 
 
+@app.post("/api/notes")
+def add_note(body: NoteIn):
+    """为本场任一提示追加一条现场问题记录。
+
+    演出中（live）或已完成（done）可记录，暂停时同样可记；记录不推进
+    提示、不改变暂停状态。保存服务端时间、当时的编号与内容快照（已发
+    提示取发出快照）以及已发/待发状态，此后的编辑不影响已存快照。
+    "写入记录 + 版本号 +1"在同一事务内提交，与确认、编辑、归档等同版本
+    竞争最多一个生效。记录随 /api/state 与档案详情按保存顺序读取，
+    不提供单条改删。
+
+    开场前或版本过期返回 409 及最新状态；提示不存在返回 404；正文去
+    首尾空白后不在 1～200 字符返回 400；失败均不改数据。
+    """
+    with lock, db() as conn:
+        meta = conn.execute("SELECT version, status FROM meta WHERE id = 1").fetchone()
+        if meta["status"] == "setup" or body.version != meta["version"]:
+            return conflict(conn)
+        row = conn.execute("SELECT * FROM cues WHERE id = ?", (body.cue_id,)).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "cue_not_found"})
+        text = body.text.strip()
+        if not (1 <= len(text) <= MAX_NOTE_LEN):
+            return bad_request(f"问题记录正文需为 1～{MAX_NOTE_LEN} 字符")
+
+        now = datetime.now(timezone.utc).isoformat()
+        content = row["issued_content"] if row["status"] == "issued" else row["content"]
+        conn.execute(
+            "INSERT INTO notes (cue_id, number, content, cue_status, text, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (row["id"], row["number"], content, row["status"], text, now),
+        )
+        conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
+        return build_state(conn)
+
+
 @app.post("/api/reset")
 def reset():
-    """清空进度，回到开场前设置。"""
+    """清空进度与现场问题记录，回到开场前设置。"""
     with lock, db() as conn:
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM notes")
         conn.execute(
             "UPDATE meta SET version = version + 1, status = 'setup', paused = 0 "
             "WHERE id = 1"
@@ -585,10 +680,10 @@ def archive(body: ArchiveIn):
     """归档本场并收场。
 
     仅演出中（live）或已完成（done）可归档；携带页面所见版本号。
-    快照（已发按发出顺序、剩余按待发顺序）写入 archives 与清空 cues、
-    回到 setup、版本号 +1 在同一事务内提交：写档案失败则整体回滚，
-    当前提示不会被清空。同版本的重复归档因版本不再匹配而拿到 409，
-    不会多建档案。
+    快照（已发按发出顺序、剩余按待发顺序、问题记录按保存顺序）写入
+    archives 与清空 cues、notes、回到 setup、版本号 +1 在同一事务内提交：
+    写档案失败则整体回滚，当前提示与问题记录不会被清空。同版本的重复
+    归档因版本不再匹配而拿到 409，不会多建档案。
     """
     name = body.name.strip()
     if not name:
@@ -600,11 +695,12 @@ def archive(body: ArchiveIn):
             return conflict(conn)
 
         issued, pending = archive_snapshots(conn)
+        notes = archive_note_snapshots(conn)
         now = datetime.now(timezone.utc).isoformat()
         new_version = meta["version"] + 1
         conn.execute(
-            "INSERT INTO archives (name, archived_at, status, version, issued, pending) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO archives (name, archived_at, status, version, issued, pending, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 now,
@@ -612,9 +708,11 @@ def archive(body: ArchiveIn):
                 meta["version"],
                 json.dumps(issued, ensure_ascii=False),
                 json.dumps(pending, ensure_ascii=False),
+                json.dumps(notes, ensure_ascii=False),
             ),
         )
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM notes")
         conn.execute(
             "UPDATE meta SET version = ?, status = 'setup', paused = 0 WHERE id = 1",
             (new_version,),
@@ -628,9 +726,10 @@ def start_from_archive(archive_id: int, body: StartFromArchiveIn):
 
     按档案已发顺序取编号与内容快照，再接待发顺序的编号与内容，全部作为
     新场待发提示；不继承发出时间或进度，也不修改原档案。仅开场前
-    （setup）允许生效，携带页面所见版本号。"写入新场提示 + 推进到演出中
-    + 版本号 +1"在同一事务内提交：任一步失败整体回滚，当前场次与档案都
-    不变。同版本的重复/并发提交只有一次生效，其余收到 409 及最新状态。
+    （setup）允许生效，携带页面所见版本号。"写入新场提示 + 清空当前问题
+    记录（不复制档案中的记录）+ 推进到演出中 + 版本号 +1"在同一事务内
+    提交：任一步失败整体回滚，当前场次与档案都不变。同版本的重复/并发
+    提交只有一次生效，其余收到 409 及最新状态。
 
     档案不存在返回 404；拼出的提示不满足 2～12 条 / 编号唯一 / 内容非空
     返回 400；非开场前或版本过期返回 409。
@@ -655,6 +754,7 @@ def start_from_archive(archive_id: int, body: StartFromArchiveIn):
             return conflict(conn)
 
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM notes")  # 开新场不复制问题记录，原档案不变
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "

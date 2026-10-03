@@ -4,6 +4,7 @@
  * 服务端版本不一致会返回 409 + 最新状态，页面据此刷新。 */
 let state = null;
 let editingId = null; // 正在编辑的待发提示 id
+let notingId = null;  // 正在追加问题记录的提示 id
 let busy = false;     // 有请求在途时禁用确认按钮，防止重复点击
 let prevStatus = null; // 上一帧状态，用于识别回到开场前的切换
 
@@ -43,6 +44,15 @@ async function api(path, body) {
       toast("操作未生效：已有人先操作，页面已刷新为最新状态");
       return null;
     }
+    if (res.status === 404) {
+      // 目标提示已不在本场（如他端已换场）：刷新为最新状态
+      toast("提示不存在，可能已换场，页面已刷新为最新状态");
+      try {
+        const res2 = await fetch("/api/state");
+        applyState(await res2.json());
+      } catch (err) { /* 刷新失败仅保留提示 */ }
+      return null;
+    }
     if (!res.ok) {
       toast(data.error || "请求失败");
       return null;
@@ -62,6 +72,9 @@ function applyState(s) {
   state = s;
   if (editingId !== null && !s.pending.some((c) => c.id === editingId)) {
     editingId = null; // 正在编辑的提示已不在待发列表（如已被确认）
+  }
+  if (notingId !== null && ![...s.pending, ...s.issued].some((c) => c.id === notingId)) {
+    notingId = null; // 正在记问题的提示已不在本场（如已重置或归档）
   }
   render();
 }
@@ -167,6 +180,7 @@ async function loadArchiveDetail(id) {
   if (viewSeq !== archivesViewSeq) return; // 已离开详情或弹窗已关闭，丢弃过期响应
   currentDetail = a;
   const total = a.issued.length + a.pending.length;
+  const notes = a.notes || []; // 旧档案无问题记录字段时按空处理
   const canStart = state && state.status === "setup";
   $("#archives-body").innerHTML = `
     <div class="archive-detail-head">
@@ -201,6 +215,11 @@ async function loadArchiveDetail(id) {
         </ul>
       </div>
     </div>
+    <h3>现场问题记录（${notes.length}）<span class="hint-inline">按保存顺序</span></h3>
+    <ul class="cue-list">
+      ${notes.length ? notes.map(noteItemHtml).join("")
+        : `<li class="empty">无现场问题记录</li>`}
+    </ul>
     <div class="actions">
       <button data-action="archive-list">← 返回列表</button>
       <button id="start-from-archive" class="primary" data-action="start-from-archive"
@@ -517,7 +536,22 @@ function render() {
 
   renderPending();
   renderIssued();
+  renderNotes();
   updateBusy();
+}
+
+/* 问题记录输入行（待发/已发列表中共用）：行内展开，保存后随最新状态刷新 */
+function noteFormLi(c, cls, badgeHtml, contentHtml) {
+  return `<li class="${cls} noting" data-id="${c.id}">
+    ${badgeHtml}
+    ${contentHtml}
+    <textarea class="note-input" rows="2" maxlength="${state.max_note_len || 200}"
+      placeholder="记录现场问题（1～${state.max_note_len || 200} 字）" aria-label="问题记录"></textarea>
+    <span class="ops">
+      <button class="primary" data-action="save-note" data-id="${c.id}">保存</button>
+      <button data-action="cancel-note">取消</button>
+    </span>
+  </li>`;
 }
 
 function renderPending() {
@@ -538,6 +572,11 @@ function renderPending() {
         <textarea class="content-input" rows="2" aria-label="内容">${escapeHtml(c.content)}</textarea>
       </li>`;
     }
+    if (c.id === notingId) {
+      return noteFormLi(c, "pending-item",
+        `<span class="badge">${escapeHtml(c.number)}</span>`,
+        `<span class="content">${escapeHtml(c.content)}</span>`);
+    }
     const tag = i === 0 ? `<span class="tag now">当前</span>`
               : i === 1 ? `<span class="tag next">下一条</span>` : "";
     return `<li class="pending-item ${i === 0 ? "is-current" : ""}" data-id="${c.id}">
@@ -546,6 +585,7 @@ function renderPending() {
       ${tag}
       <span class="ops">
         <button data-action="edit" data-id="${c.id}" title="改写">✎</button>
+        <button data-action="note" data-id="${c.id}" title="追加现场问题记录">📝</button>
         <button data-action="up" data-idx="${i}" ${i === 0 ? "disabled" : ""} title="上移">↑</button>
         <button data-action="down" data-idx="${i}" ${i === items.length - 1 ? "disabled" : ""} title="下移">↓</button>
       </span>
@@ -561,12 +601,46 @@ function renderIssued() {
   }
   ul.innerHTML = state.issued.map((c) => {
     const t = c.issued_at ? new Date(c.issued_at).toLocaleTimeString() : "";
+    if (c.id === notingId) {
+      return noteFormLi(c, "issued-item",
+        `<span class="badge done">✓ ${escapeHtml(c.number)}</span>`,
+        `<span class="content">${escapeHtml(c.content)}</span>`);
+    }
     return `<li class="issued-item">
       <span class="badge done">✓ ${escapeHtml(c.number)}</span>
       <span class="content">${escapeHtml(c.content)}</span>
       <span class="time">${t}</span>
+      <span class="ops">
+        <button data-action="note" data-id="${c.id}" title="追加现场问题记录">📝</button>
+      </span>
     </li>`;
   }).join("");
+}
+
+/* 单条问题记录的展示结构：编号/当时状态快照 + 服务端时间 + 正文 + 当时内容 */
+function noteItemHtml(n) {
+  const statusTag = n.cue_status === "issued"
+    ? `<span class="tag issued">已发</span>`
+    : `<span class="tag pending">待发</span>`;
+  return `<li class="note-item">
+    <div class="note-head">
+      <span class="badge">${escapeHtml(n.number)}</span>
+      ${statusTag}
+      <span class="time">${fmtTime(n.created_at)}</span>
+    </div>
+    <div class="note-text">${escapeHtml(n.text)}</div>
+    <div class="note-cue">当时内容：${escapeHtml(n.content)}</div>
+  </li>`;
+}
+
+function renderNotes() {
+  const ul = $("#notes-list");
+  const notes = state.notes || [];
+  if (!notes.length) {
+    ul.innerHTML = `<li class="empty">尚无现场问题记录</li>`;
+    return;
+  }
+  ul.innerHTML = notes.map(noteItemHtml).join("");
 }
 
 /* ---------------------------------------------------------------- 设置页 */
@@ -626,6 +700,24 @@ document.addEventListener("click", (e) => {
     const id = Number(btn.dataset.id);
     editingId = null;
     api("/api/edit", { version: state.version, cue_id: id, number, content });
+  } else if (action === "note") {
+    notingId = Number(btn.dataset.id);
+    render();
+    const input = $(".note-input");
+    if (input) input.focus();
+  } else if (action === "cancel-note") {
+    notingId = null;
+    render();
+  } else if (action === "save-note") {
+    const li = btn.closest("li");
+    const text = $(".note-input", li).value.trim();
+    const maxLen = state.max_note_len || 200;
+    if (!text) { toast("问题记录不能为空"); return; }
+    if (text.length > maxLen) { toast(`问题记录不能超过 ${maxLen} 字`); return; }
+    const id = Number(btn.dataset.id);
+    notingId = null;
+    // 携带页面所见版本号；与确认/编辑/归档同版本竞争时最多一个生效
+    api("/api/notes", { version: state.version, cue_id: id, text });
   } else if (action === "up" || action === "down") {
     const ids = state.pending.map((c) => c.id);
     const i = Number(btn.dataset.idx);

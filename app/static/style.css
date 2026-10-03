@@ -241,6 +241,29 @@ button.warning-outline { border-color: var(--accent); color: var(--accent); back
 .pending-item.editing .content-input { flex: 1 1 100%; order: 3; }
 .pending-item.editing .ops { margin-left: auto; }
 
+/* ---------- 现场问题记录 ---------- */
+.pending-item.noting, .issued-item.noting { flex-wrap: wrap; }
+.pending-item.noting .note-input, .issued-item.noting .note-input { flex: 1 1 100%; order: 3; }
+.pending-item.noting .ops, .issued-item.noting .ops { margin-left: auto; }
+
+.note-item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.note-head { display: flex; align-items: center; gap: 8px; }
+.note-head .time { margin-left: auto; }
+.note-text { margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.note-cue {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 /* ---------- 顶部操作与档案库 ---------- */
 .topbar-ops { display: flex; gap: 10px; }
 
