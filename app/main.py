@@ -1,12 +1,13 @@
 """舞台提示执行台 —— FastAPI + SQLite 后端。
 
 并发模型：所有写操作（确认 / 暂停 / 恢复 / 编辑 / 重排 / 归档 / 设置 /
-重置 / 以档案开新场）都在同一把锁内串行完成；其中带版本号的操作
-（确认 / 暂停恢复 / 编辑 / 重排 / 归档 / 以档案开新场）在锁内完成
-"检查版本号 -> 修改数据"两个步骤，因此同一版本号上并发的两个操作
-只会有一个生效，另一个收到 409 及最新状态。归档的"写档案 + 清空提示"、
-以档案开新场的"写入新场提示 + 推进状态"、暂停恢复的"暂停标记 + 版本 +1"
-都在同一事务内提交，任一步失败整体回滚。
+问题记录 / 重置 / 以档案开新场）都在同一把锁内串行完成；其中带版本号的
+操作（确认 / 暂停恢复 / 编辑 / 重排 / 归档 / 问题记录 / 以档案开新场）在
+锁内完成"检查版本号 -> 修改数据"两个步骤，因此同一版本号上并发的两个操作
+只会有一个生效，另一个收到 409 及最新状态。归档的"写档案（含问题记录快照）
++ 清空提示与问题记录"、以档案开新场的"写入新场提示 + 推进状态"、暂停恢复
+的"暂停标记 + 版本 +1"、问题记录的"插入记录 + 版本 +1"都在同一事务内
+提交，任一步失败整体回滚。
 """
 import json
 import os
@@ -26,6 +27,8 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "data", "cues.db"))
 
 MIN_CUES = 2
 MAX_CUES = 12
+ISSUE_MIN_LEN = 1
+ISSUE_MAX_LEN = 200
 
 # 串行化所有写操作，保证版本检查与落库是原子的。
 lock = threading.Lock()
@@ -74,6 +77,15 @@ def init_db() -> None:
                 issued_at      TEXT,
                 issued_seq     INTEGER                  -- 发出顺序
             );
+            CREATE TABLE IF NOT EXISTS issues (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 同时即保存顺序
+                cue_id     INTEGER NOT NULL,           -- 记录关联的本场提示
+                cue_number TEXT NOT NULL,              -- 记录当时的编号快照
+                cue_status TEXT NOT NULL,              -- 记录当时状态：pending | issued
+                cue_content TEXT NOT NULL,             -- 编号指向内容：已发为发出快照
+                text       TEXT NOT NULL,              -- 现场问题正文（已去除首尾空白）
+                created_at TEXT NOT NULL               -- 服务端保存时间（UTC ISO）
+            );
             CREATE TABLE IF NOT EXISTS archives (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 name        TEXT NOT NULL,              -- 场次名称
@@ -81,7 +93,8 @@ def init_db() -> None:
                 status      TEXT NOT NULL,              -- 归档当时状态：live | done
                 version     INTEGER NOT NULL,           -- 归档时携带的页面版本
                 issued      TEXT NOT NULL,              -- 已发：编号/快照/时间（按发出顺序）
-                pending     TEXT NOT NULL               -- 剩余：编号/内容（按待发顺序）
+                pending     TEXT NOT NULL,             -- 剩余：编号/内容（按待发顺序）
+                issues      TEXT NOT NULL DEFAULT '[]' -- 现场问题记录（按保存顺序）
             );
             """
         )
@@ -94,9 +107,36 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE meta ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
             )
+        # 旧库升级：archives 表缺少 issues 列时补上，旧档案默认无问题记录。
+        archive_columns = {
+            r["name"] for r in conn.execute("PRAGMA table_info(archives)")
+        }
+        if "issues" not in archive_columns:
+            conn.execute("ALTER TABLE archives ADD COLUMN issues TEXT NOT NULL DEFAULT '[]'")
 
 
 # ---------------------------------------------------------------- 状态组装
+
+def issue_json(r: sqlite3.Row) -> dict:
+    """一条现场问题记录；已发提示的 cue_content 取发出快照，不可再变。"""
+    return {
+        "id": r["id"],
+        "cue_id": r["cue_id"],
+        "cue_number": r["cue_number"],
+        "cue_status": r["cue_status"],
+        "cue_content": r["cue_content"],
+        "text": r["text"],
+        "created_at": r["created_at"],
+    }
+
+
+def issue_rows(conn: sqlite3.Connection) -> list[dict]:
+    """本场现场问题记录，按保存顺序（自增 id）返回。"""
+    return [
+        issue_json(r)
+        for r in conn.execute("SELECT * FROM issues ORDER BY id ASC").fetchall()
+    ]
+
 
 def build_state(conn: sqlite3.Connection) -> dict:
     meta = conn.execute(
@@ -130,6 +170,7 @@ def build_state(conn: sqlite3.Connection) -> dict:
         "next": pending_json(pending[1]) if len(pending) > 1 else None,
         "pending": [pending_json(r) for r in pending],
         "issued": [issued_json(r) for r in issued],
+        "issues": issue_rows(conn),
         "total": len(rows),
         "remaining": len(pending),
         "min_cues": MIN_CUES,
@@ -168,8 +209,8 @@ def cue_list_error(cues: list[tuple[str, str]]) -> Optional[str]:
 
 # ---------------------------------------------------------------- 档案组装
 
-def archive_snapshots(conn: sqlite3.Connection) -> tuple[list[dict], list[dict]]:
-    """读取归档快照：已发按发出顺序、剩余按待发顺序。"""
+def archive_snapshots(conn: sqlite3.Connection) -> tuple[list[dict], list[dict], list[dict]]:
+    """读取归档快照：已发按发出顺序、剩余按待发顺序、问题记录按保存顺序。"""
     rows = conn.execute("SELECT * FROM cues ORDER BY position ASC, id ASC").fetchall()
     issued = [
         {
@@ -187,12 +228,13 @@ def archive_snapshots(conn: sqlite3.Connection) -> tuple[list[dict], list[dict]]
         for r in rows
         if r["status"] == "pending"
     ]
-    return issued, pending
+    return issued, pending, issue_rows(conn)
 
 
 def archive_summary(row: sqlite3.Row) -> dict:
     issued = json.loads(row["issued"])
     pending = json.loads(row["pending"])
+    issues = json.loads(row["issues"]) if row["issues"] is not None else []
     return {
         "id": row["id"],
         "name": row["name"],
@@ -200,6 +242,7 @@ def archive_summary(row: sqlite3.Row) -> dict:
         "status": row["status"],
         "issued_count": len(issued),
         "pending_count": len(pending),
+        "issue_count": len(issues),
     }
 
 
@@ -212,6 +255,8 @@ def archive_detail(row: sqlite3.Row) -> dict:
         "version": row["version"],
         "issued": json.loads(row["issued"]),
         "pending": json.loads(row["pending"]),
+        # 旧档案（迁移前建立）该列为 NULL，视为无问题记录。
+        "issues": json.loads(row["issues"]) if row["issues"] is not None else [],
     }
 
 
@@ -357,6 +402,12 @@ class ReorderIn(BaseModel):
     order: list[int]
 
 
+class IssueIn(BaseModel):
+    version: int
+    cue_id: int
+    text: str
+
+
 class StartFromArchiveIn(BaseModel):
     version: int
 
@@ -432,6 +483,7 @@ def setup(body: SetupIn):
 
     with lock, db() as conn:
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM issues")  # 手工录入新场：清空上场遗留的问题记录
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "
@@ -568,11 +620,68 @@ def reorder(body: ReorderIn):
         return build_state(conn)
 
 
+@app.post("/api/issues")
+def add_issue(body: IssueIn):
+    """为当前场次任一提示追加一条现场问题记录。
+
+    演出中（含暂停时）或已完成都可记录，开场前（无本场提示）返回 409。
+    保存服务端时间、当时编号、内容快照与已发/待发状态：已发提示取其发出
+    快照（编号与内容此后不可变），待发提示取当前编号与内容。"插入记录 +
+    版本 +1"在同一事务内提交：不推进提示、不改变暂停状态；写入失败则记录
+    与版本都不变。与确认、编辑、重排、暂停恢复、归档同版本竞争，最多一个
+    成功，其余收到 409 及最新状态。
+
+    正文去除首尾空白后须为 1～200 字符，不合规返回 400；提示不存在返回
+    404；开场前或版本过期返回 409。任何失败都不改数据。
+    """
+    text = body.text.strip()
+    if not (ISSUE_MIN_LEN <= len(text) <= ISSUE_MAX_LEN):
+        return bad_request(
+            f"问题内容去除首尾空白后需为 {ISSUE_MIN_LEN}～{ISSUE_MAX_LEN} 字符"
+        )
+
+    with lock, db() as conn:
+        meta = conn.execute(
+            "SELECT version, status FROM meta WHERE id = 1"
+        ).fetchone()
+        if meta["status"] not in ("live", "done") or body.version != meta["version"]:
+            return conflict(conn)
+        row = conn.execute(
+            "SELECT * FROM cues WHERE id = ?", (body.cue_id,)
+        ).fetchone()
+        if row is None:
+            return JSONResponse(
+                status_code=404, content={"error": "cue_not_found"}
+            )
+        # 已发提示保存其发出快照；待发提示保存当前编号与内容。
+        if row["status"] == "issued":
+            cue_number, cue_content = row["number"], row["issued_content"]
+        else:
+            cue_number, cue_content = row["number"], row["content"]
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO issues "
+            "(cue_id, cue_number, cue_status, cue_content, text, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                row["id"],
+                cue_number,
+                row["status"],
+                cue_content,
+                text,
+                now,
+            ),
+        )
+        conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
+        return build_state(conn)
+
+
 @app.post("/api/reset")
 def reset():
     """清空进度，回到开场前设置。"""
     with lock, db() as conn:
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM issues")  # 重置一并清空当前场问题记录
         conn.execute(
             "UPDATE meta SET version = version + 1, status = 'setup', paused = 0 "
             "WHERE id = 1"
@@ -585,10 +694,10 @@ def archive(body: ArchiveIn):
     """归档本场并收场。
 
     仅演出中（live）或已完成（done）可归档；携带页面所见版本号。
-    快照（已发按发出顺序、剩余按待发顺序）写入 archives 与清空 cues、
-    回到 setup、版本号 +1 在同一事务内提交：写档案失败则整体回滚，
-    当前提示不会被清空。同版本的重复归档因版本不再匹配而拿到 409，
-    不会多建档案。
+    快照（已发按发出顺序、剩余按待发顺序、问题记录按保存顺序）写入 archives
+    与清空 cues/issues、回到 setup、版本号 +1 在同一事务内提交：写档案失败
+    则整体回滚，当前提示与问题记录都不会被清空。同版本的重复归档因版本不再
+    匹配而拿到 409，不会多建档案。
     """
     name = body.name.strip()
     if not name:
@@ -599,12 +708,12 @@ def archive(body: ArchiveIn):
         if meta["status"] not in ("live", "done") or body.version != meta["version"]:
             return conflict(conn)
 
-        issued, pending = archive_snapshots(conn)
+        issued, pending, issues = archive_snapshots(conn)
         now = datetime.now(timezone.utc).isoformat()
         new_version = meta["version"] + 1
         conn.execute(
-            "INSERT INTO archives (name, archived_at, status, version, issued, pending) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO archives (name, archived_at, status, version, issued, pending, issues) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 now,
@@ -612,9 +721,11 @@ def archive(body: ArchiveIn):
                 meta["version"],
                 json.dumps(issued, ensure_ascii=False),
                 json.dumps(pending, ensure_ascii=False),
+                json.dumps(issues, ensure_ascii=False),
             ),
         )
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM issues")  # 已随档案保存，当前场记录清空
         conn.execute(
             "UPDATE meta SET version = ?, status = 'setup', paused = 0 WHERE id = 1",
             (new_version,),
@@ -655,6 +766,7 @@ def start_from_archive(archive_id: int, body: StartFromArchiveIn):
             return conflict(conn)
 
         conn.execute("DELETE FROM cues")
+        conn.execute("DELETE FROM issues")  # 以档案开新场不复制问题记录，原档案不变
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "

@@ -241,6 +241,49 @@ button.warning-outline { border-color: var(--accent); color: var(--accent); back
 .pending-item.editing .content-input { flex: 1 1 100%; order: 3; }
 .pending-item.editing .ops { margin-left: auto; }
 
+/* ---------- 现场问题记录 ---------- */
+.issues-head { margin-top: 22px; }
+.issue-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.issue-item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.issue-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.issue-top .time { margin-left: auto; }
+.issue-text { line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+.issue-cue-content {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.tag.issue-issued { background: rgba(76,195,138,.15); color: var(--green); border: 1px solid var(--green); }
+.tag.issue-pending { background: rgba(245,185,66,.12); color: var(--accent); border: 1px solid var(--accent); }
+
+.issue-edit {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.issue-edit .ops { margin-left: auto; }
+.issue-edit .issue-input { flex: 1 1 100%; order: 3; }
+.issue-edit .issue-meta { flex: 1 1 100%; order: 4; margin: 2px 0 0; }
+
 /* ---------- 顶部操作与档案库 ---------- */
 .topbar-ops { display: flex; gap: 10px; }
 

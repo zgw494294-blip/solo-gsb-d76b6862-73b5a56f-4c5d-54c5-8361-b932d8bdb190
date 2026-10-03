@@ -4,6 +4,7 @@
  * 服务端版本不一致会返回 409 + 最新状态，页面据此刷新。 */
 let state = null;
 let editingId = null; // 正在编辑的待发提示 id
+let editingIssueId = null; // 正在追加现场问题记录的提示 id（已发或待发）
 let busy = false;     // 有请求在途时禁用确认按钮，防止重复点击
 let prevStatus = null; // 上一帧状态，用于识别回到开场前的切换
 
@@ -63,6 +64,11 @@ function applyState(s) {
   if (editingId !== null && !s.pending.some((c) => c.id === editingId)) {
     editingId = null; // 正在编辑的提示已不在待发列表（如已被确认）
   }
+  if (editingIssueId !== null &&
+      !s.pending.some((c) => c.id === editingIssueId) &&
+      !s.issued.some((c) => c.id === editingIssueId)) {
+    editingIssueId = null; // 追加问题的提示已不在本场（归档 / 重置 / 开新场）
+  }
   render();
 }
 
@@ -88,6 +94,28 @@ let archivesViewSeq = 0;
 
 function statusLabel(status) {
   return status === "done" ? "已完成" : "提前收场";
+}
+
+/* 档案详情中的现场问题记录区块：按保存顺序，已发/待发状态与内容均为归档快照。 */
+function archiveIssuesHtml(issues) {
+  return `
+    <h3>现场问题记录（${issues.length}）<span class="hint-inline">按保存顺序 · 随档案快照保存</span></h3>
+    <ul class="issue-list">
+      ${issues.length ? issues.map((it) => {
+        const tag = it.cue_status === "issued"
+          ? `<span class="tag issue-issued">已发</span>`
+          : `<span class="tag issue-pending">待发</span>`;
+        return `<li class="issue-item">
+          <div class="issue-top">
+            <span class="badge">${escapeHtml(it.cue_number)}</span>
+            ${tag}
+            <span class="time">${fmtTime(it.created_at)}</span>
+          </div>
+          <div class="issue-text">${escapeHtml(it.text)}</div>
+          <div class="issue-cue-content" title="记录时该提示的内容快照">↳ ${escapeHtml(it.cue_content)}</div>
+        </li>`;
+      }).join("") : `<li class="empty">无（本场未记录现场问题）</li>`}
+    </ul>`;
 }
 
 function fmtTime(iso) {
@@ -145,7 +173,7 @@ async function loadArchiveList() {
             <span class="tag ${a.status === "done" ? "done" : "early"}">${statusLabel(a.status)}</span>
             <span class="time">${fmtTime(a.archived_at)}</span>
           </span>
-          <span class="archive-count">已发 ${a.issued_count} · 剩余 ${a.pending_count}</span>
+          <span class="archive-count">已发 ${a.issued_count} · 剩余 ${a.pending_count} · 问题 ${a.issue_count || 0}</span>
         </li>`).join("")}
     </ul>`;
 }
@@ -201,6 +229,7 @@ async function loadArchiveDetail(id) {
         </ul>
       </div>
     </div>
+    ${archiveIssuesHtml(a.issues || [])}
     <div class="actions">
       <button data-action="archive-list">← 返回列表</button>
       <button id="start-from-archive" class="primary" data-action="start-from-archive"
@@ -517,6 +546,7 @@ function render() {
 
   renderPending();
   renderIssued();
+  renderIssues();
   updateBusy();
 }
 
@@ -528,6 +558,9 @@ function renderPending() {
     return;
   }
   ul.innerHTML = items.map((c, i) => {
+    if (c.id === editingIssueId) {
+      return issueEditHtml(c, "pending");
+    }
     if (c.id === editingId) {
       return `<li class="pending-item editing" data-id="${c.id}">
         <input class="num-input" value="${escapeHtml(c.number)}" maxlength="30" aria-label="编号">
@@ -546,6 +579,7 @@ function renderPending() {
       ${tag}
       <span class="ops">
         <button data-action="edit" data-id="${c.id}" title="改写">✎</button>
+        <button data-action="add-issue" data-id="${c.id}" title="记现场问题">⚠</button>
         <button data-action="up" data-idx="${i}" ${i === 0 ? "disabled" : ""} title="上移">↑</button>
         <button data-action="down" data-idx="${i}" ${i === items.length - 1 ? "disabled" : ""} title="下移">↓</button>
       </span>
@@ -560,11 +594,75 @@ function renderIssued() {
     return;
   }
   ul.innerHTML = state.issued.map((c) => {
+    if (c.id === editingIssueId) return issueEditHtml(c, "issued");
     const t = c.issued_at ? new Date(c.issued_at).toLocaleTimeString() : "";
     return `<li class="issued-item">
       <span class="badge done">✓ ${escapeHtml(c.number)}</span>
       <span class="content">${escapeHtml(c.content)}</span>
       <span class="time">${t}</span>
+      <span class="ops">
+        <button data-action="add-issue" data-id="${c.id}" title="记现场问题">⚠</button>
+      </span>
+    </li>`;
+  }).join("");
+}
+
+/* 为一条已发/待发提示追加现场问题记录的内联表单（暂停时同样可用）。
+ * 已发提示记录其发出快照，待发提示记录当前编号与内容。 */
+function issueEditHtml(c, cueStatus) {
+  const statusTag = cueStatus === "issued"
+    ? `<span class="tag issue-issued">已发</span>`
+    : `<span class="tag issue-pending">待发</span>`;
+  return `<li class="issue-edit" data-id="${c.id}">
+    <span class="badge">${escapeHtml(c.number)}</span>
+    ${statusTag}
+    <span class="ops">
+      <button class="primary" data-action="save-issue" data-id="${c.id}">保存记录</button>
+      <button data-action="cancel-issue">取消</button>
+    </span>
+    <textarea class="issue-input" rows="2" maxlength="200"
+      placeholder="现场问题（去除首尾空白后 1～200 字符）" aria-label="现场问题"></textarea>
+    <p class="hint-inline issue-meta">将随版本 v${state.version} 保存为服务端时间的快照；不改提示进度${state.paused ? "，暂停时也可记录" : ""}。</p>
+  </li>`;
+}
+
+async function saveIssue(id) {
+  const li = $(`.issue-edit[data-id="${id}"]`);
+  const input = li ? $(".issue-input", li) : null;
+  const text = input ? input.value.trim() : "";
+  if (!text) { toast("问题内容不能为空"); if (input) input.focus(); return; }
+  if (text.length > 200) { toast("问题内容不能超过 200 字符"); if (input) input.focus(); return; }
+  // 400（正文不合规）时 api 不刷新状态，表单与已输入文字保留；
+  // 409 时 api 已应用最新状态并提示；成功后退出表单，记录出现在侧栏。
+  const data = await api("/api/issues", { version: state.version, cue_id: id, text });
+  if (data) {
+    editingIssueId = null;
+    render();
+  }
+}
+
+function renderIssues() {
+  const ul = $("#issues-list");
+  const count = $("#issues-count");
+  const issues = state.issues || [];
+  if (count) count.textContent = issues.length ? `（${issues.length} 条，按保存顺序）` : "";
+  if (!issues.length) {
+    ul.innerHTML = `<li class="empty">尚无现场问题记录；点提示后的 ⚠ 可随时记录（含暂停时）</li>`;
+    return;
+  }
+  ul.innerHTML = issues.map((it) => {
+    const tag = it.cue_status === "issued"
+      ? `<span class="tag issue-issued">已发</span>`
+      : `<span class="tag issue-pending">待发</span>`;
+    const t = it.created_at ? new Date(it.created_at).toLocaleString() : "";
+    return `<li class="issue-item">
+      <div class="issue-top">
+        <span class="badge">${escapeHtml(it.cue_number)}</span>
+        ${tag}
+        <span class="time">${t}</span>
+      </div>
+      <div class="issue-text">${escapeHtml(it.text)}</div>
+      <div class="issue-cue-content" title="记录时该提示的内容快照">↳ ${escapeHtml(it.cue_content)}</div>
     </li>`;
   }).join("");
 }
@@ -614,6 +712,7 @@ document.addEventListener("click", (e) => {
     api("/api/confirm", { version: state.version });
   } else if (action === "edit") {
     editingId = Number(btn.dataset.id);
+    editingIssueId = null;
     render();
   } else if (action === "cancel-edit") {
     editingId = null;
@@ -633,6 +732,17 @@ document.addEventListener("click", (e) => {
     if (j < 0 || j >= ids.length) return;
     [ids[i], ids[j]] = [ids[j], ids[i]];
     api("/api/reorder", { version: state.version, order: ids });
+  } else if (action === "add-issue") {
+    const id = Number(btn.dataset.id);
+    // 同一时刻只开一个问题记录表单
+    editingIssueId = editingIssueId === id ? null : id;
+    editingId = null;
+    render();
+  } else if (action === "cancel-issue") {
+    editingIssueId = null;
+    render();
+  } else if (action === "save-issue") {
+    saveIssue(Number(btn.dataset.id));
   }
 });
 
